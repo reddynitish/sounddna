@@ -26,34 +26,49 @@ def get_era(year):
         return "2020s"
     except: return "Unknown"
 
-def https_get(host, path, headers=None):
-    conn = http.client.HTTPSConnection(host, timeout=10)
-    conn.request("GET", path, headers=headers or {})
-    r = conn.getresponse()
-    body = r.read().decode("utf-8")
-    conn.close()
-    return r.status, json.loads(body) if body else (r.status, {})
-
-def https_post(host, path, body, headers=None):
-    conn = http.client.HTTPSConnection(host, timeout=10)
-    conn.request("POST", path, body=body, headers=headers or {})
+def https_request(host, path, method="GET", body=None, headers=None):
+    conn = http.client.HTTPSConnection(host, timeout=15)
+    conn.request(method, path, body=body, headers=headers or {})
     r = conn.getresponse()
     resp_body = r.read().decode("utf-8")
     conn.close()
-    return r.status, json.loads(resp_body)
+    try:
+        data = json.loads(resp_body) if resp_body else {}
+    except:
+        data = {"_raw": resp_body[:200]}
+    return r.status, data
 
 def get_spotify_token():
     creds = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
-    status, data = https_post("accounts.spotify.com", "/api/token", "grant_type=client_credentials",
+    status, data = https_request("accounts.spotify.com", "/api/token", "POST", "grant_type=client_credentials",
         {"Authorization": f"Basic {creds}", "Content-Type": "application/x-www-form-urlencoded"})
-    if status != 200: raise Exception(f"Token error: {data}")
+    if status != 200: raise Exception(f"Spotify token error: {data}")
     return data["access_token"]
 
 def spotify_get(path, token):
-    status, data = https_get("api.spotify.com", path, {"Authorization": f"Bearer {token}"})
-    if status == 401: raise Exception("Spotify auth failed")
-    if status >= 400: raise Exception(f"Spotify error {status}: {data}")
+    status, data = https_request("api.spotify.com", path, headers={"Authorization": f"Bearer {token}"})
+    if status >= 400: raise Exception(f"Spotify API error {status}")
     return data
+
+def reccobeats_get(path):
+    """ReccoBeats - free replacement for Spotify's deprecated audio-features and recommendations endpoints."""
+    status, data = https_request("api.reccobeats.com", path)
+    if status >= 400: raise Exception(f"ReccoBeats error {status}")
+    return data
+
+def get_audio_features_via_reccobeats(spotify_id):
+    """Fetch audio features by Spotify ID using ReccoBeats."""
+    track_data = reccobeats_get(f"/v1/track?ids={spotify_id}")
+    items = track_data.get("content", [])
+    if not items: raise Exception("Track not found in ReccoBeats database")
+    recco_id = items[0]["id"]
+    af = reccobeats_get(f"/v1/track/{recco_id}/audio-features")
+    return af, recco_id
+
+def get_recommendations_via_reccobeats(spotify_id, limit=8):
+    """Get recommendations using ReccoBeats."""
+    data = reccobeats_get(f"/v1/track/recommendation?seeds={spotify_id}&size={limit}")
+    return data.get("content", [])
 
 def extract_spotify_id(url):
     m = re.search(r"track/([A-Za-z0-9]+)", url)
@@ -61,7 +76,7 @@ def extract_spotify_id(url):
 
 def get_youtube_title(url):
     encoded = urllib.parse.quote(url, safe="")
-    status, data = https_get("www.youtube.com", f"/oembed?url={encoded}&format=json")
+    status, data = https_request("www.youtube.com", f"/oembed?url={encoded}&format=json")
     if status != 200: raise Exception("Could not fetch YouTube info")
     return data.get("title", "")
 
@@ -69,7 +84,7 @@ def search_spotify(query, token):
     encoded = urllib.parse.quote(query)
     data = spotify_get(f"/v1/search?q={encoded}&type=track&limit=1", token)
     items = data.get("tracks", {}).get("items", [])
-    if not items: raise Exception(f"No results for: {query}")
+    if not items: raise Exception(f"No Spotify results for: {query}")
     return items[0]
 
 def parse_track(data):
@@ -79,8 +94,7 @@ def parse_track(data):
     return {"spotify_id":data["id"],"name":data["name"],"artist":", ".join(a["name"] for a in data.get("artists",[])),"artist_ids":[a["id"] for a in data.get("artists",[])],"image":image,"year":release[:4] if release else None,"external_url":data.get("external_urls",{}).get("spotify")}
 
 def get_artist_genres(artist_id, token):
-    try:
-        return spotify_get(f"/v1/artists/{artist_id}", token).get("genres", [])
+    try: return spotify_get(f"/v1/artists/{artist_id}", token).get("genres", [])
     except: return []
 
 def infer_instruments(af, genres):
@@ -123,8 +137,8 @@ def parse_timestamp(ts):
     except: pass
     return None
 
-def describe_timestamp(ts_seconds, af):
-    duration_s = af.get("duration_ms",240000) / 1000
+def describe_timestamp(ts_seconds, af, duration_ms):
+    duration_s = (duration_ms or 240000) / 1000
     ratio = ts_seconds/duration_s if duration_s > 0 else 0.5
     time_str = f"{ts_seconds//60}:{ts_seconds%60:02d}"
     if ratio < 0.15: section = "intro"
@@ -137,14 +151,14 @@ def describe_timestamp(ts_seconds, af):
     md = "uplifting" if v > 0.6 else ("melancholic" if v < 0.35 else "neutral")
     return {"time":time_str,"description":f"Pinned at {time_str} — likely the {section}. {ed.capitalize()} with a {md} tone."}
 
-def build_fingerprint(track_info, af, genres, timestamp):
+def build_fingerprint(track_info, af, genres, timestamp, duration_ms):
     key_num = af.get("key",-1); mode_num = af.get("mode",1); tempo = af.get("tempo",0)
     key_name = KEY_NAMES[key_num] if 0 <= key_num <= 11 else "Unknown"
     mode_name = "Major" if mode_num == 1 else "Minor"
     fp = {"spotify_id":track_info.get("spotify_id"),"key":f"{key_name} {mode_name}","tempo":round(tempo,1),"era":get_era(track_info.get("year")),"mode":mode_name,"genres":genres[:6],"instruments":infer_instruments(af,genres),"vocal_style":infer_vocal_style(af,genres),"audio_features":{"energy":round(af.get("energy",0),3),"danceability":round(af.get("danceability",0),3),"valence":round(af.get("valence",0),3),"acousticness":round(af.get("acousticness",0),3),"instrumentalness":round(af.get("instrumentalness",0),3),"speechiness":round(af.get("speechiness",0),3),"liveness":round(af.get("liveness",0),3),"tempo_norm":round(min(tempo/200,1.0),3)}}
     if timestamp:
         ts_s = parse_timestamp(timestamp)
-        if ts_s is not None: fp["timestamp_highlight"] = describe_timestamp(ts_s, af)
+        if ts_s is not None: fp["timestamp_highlight"] = describe_timestamp(ts_s, af, duration_ms)
     fp["hash"] = hashlib.sha256(json.dumps({"id":track_info.get("spotify_id"),"ts":timestamp or "none"}).encode()).hexdigest()
     return fp
 
@@ -157,21 +171,35 @@ def label_ingredients(af, fp):
     if fp.get("era") and fp["era"] != "Unknown": labels.append(fp["era"])
     return labels[:5]
 
-def get_recommendations(track_id, artist_ids, af, token, limit=6):
+def parse_recco_track(t):
+    """Parse a track from ReccoBeats response."""
+    artists = ", ".join(a["name"] for a in t.get("artists",[]))
+    href = t.get("href","")
+    spotify_id = href.split("/")[-1] if "/track/" in href else t.get("id","")
+    return {"id":spotify_id,"title":t.get("trackTitle","Unknown"),"artist":artists,"image":None,"year":None,"external_url":href,"match_score":0}
+
+def enrich_recommendations(recco_tracks, token, ingredient_labels):
+    """Enrich ReccoBeats recommendations with Spotify metadata (album art)."""
     import random
-    seed_artists = ",".join(artist_ids[:1])
-    params = urllib.parse.urlencode({k:v for k,v in {"seed_tracks":track_id,"seed_artists":seed_artists,"limit":limit,"target_energy":af.get("energy"),"target_valence":af.get("valence"),"target_tempo":af.get("tempo"),"target_acousticness":af.get("acousticness"),"target_danceability":af.get("danceability")}.items() if v is not None})
-    data = spotify_get(f"/v1/recommendations?{params}", token)
     results = []
-    for t in data.get("tracks",[]):
-        images = t.get("album",{}).get("images",[])
-        image = images[0]["url"] if images else None
-        release = t.get("album",{}).get("release_date","")
-        pop = t.get("popularity",50)/100
-        score = min(max(round(0.72 + pop*0.15 + random.uniform(-0.08,0.08),2),0.55),0.97)
-        results.append({"id":t["id"],"title":t["name"],"artist":", ".join(a["name"] for a in t.get("artists",[])),"image":image,"year":release[:4] if release else None,"external_url":t.get("external_urls",{}).get("spotify"),"match_score":score})
+    for t in recco_tracks:
+        rec = parse_recco_track(t)
+        # Try to get album art from Spotify
+        if rec["id"]:
+            try:
+                spotify_data = spotify_get(f"/v1/tracks/{rec['id']}", token)
+                images = spotify_data.get("album",{}).get("images",[])
+                rec["image"] = images[0]["url"] if images else None
+                release = spotify_data.get("album",{}).get("release_date","")
+                rec["year"] = release[:4] if release else None
+                rec["external_url"] = spotify_data.get("external_urls",{}).get("spotify", rec["external_url"])
+            except: pass
+        score = round(0.72 + random.uniform(-0.08, 0.18), 2)
+        rec["match_score"] = max(min(score, 0.97), 0.55)
+        rec["matching_ingredients"] = ingredient_labels
+        results.append(rec)
     results.sort(key=lambda x: x["match_score"], reverse=True)
-    return results
+    return results[:6]
 
 def analyze(url, timestamp):
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
@@ -186,27 +214,31 @@ def analyze(url, timestamp):
     else:
         raise Exception("Only Spotify and YouTube links supported")
     track_info = parse_track(raw)
-    af_data = spotify_get(f"/v1/audio-features/{track_info['spotify_id']}", token)
+    duration_ms = raw.get("duration_ms")
+    # Audio features via ReccoBeats (Spotify deprecated this endpoint)
+    af_data, recco_id = get_audio_features_via_reccobeats(track_info["spotify_id"])
     genres = get_artist_genres(track_info["artist_ids"][0], token) if track_info.get("artist_ids") else []
-    fp = build_fingerprint(track_info, af_data, genres, timestamp)
+    fp = build_fingerprint(track_info, af_data, genres, timestamp, duration_ms)
     ingredient_labels = label_ingredients(af_data, fp)
-    recs = get_recommendations(track_info["spotify_id"], track_info.get("artist_ids",[]), af_data, token)
-    for r in recs: r["matching_ingredients"] = ingredient_labels
+    # Recommendations via ReccoBeats
+    try:
+        recco_tracks = get_recommendations_via_reccobeats(track_info["spotify_id"])
+        recs = enrich_recommendations(recco_tracks, token, ingredient_labels)
+    except:
+        recs = []
     return {"song":{"title":track_info["name"],"artist":track_info["artist"],"image":track_info["image"],"year":track_info["year"],"spotify_id":track_info["spotify_id"]},"fingerprint":fp,"recommendations":recs}
 
 class handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.send_response(200); self._cors(); self.end_headers()
     def do_GET(self):
-        # Allow GET requests with ?url=... as fallback
         try:
             parsed = urllib.parse.urlparse(self.path)
             qs = urllib.parse.parse_qs(parsed.query)
             url = (qs.get("url") or [""])[0]
             timestamp = (qs.get("timestamp") or [None])[0]
             if not url: return self._respond(400, {"detail":"url query param required"})
-            result = analyze(url, timestamp)
-            self._respond(200, result)
+            self._respond(200, analyze(url, timestamp))
         except Exception as e:
             self._respond(422, {"detail": str(e)})
     def do_POST(self):
@@ -218,20 +250,17 @@ class handler(BaseHTTPRequestHandler):
                     try: length = int(v); break
                     except: pass
             body = self.rfile.read(length) if length > 0 else b""
-            if not body:
-                # Fallback: try query string
+            if body:
+                payload = json.loads(body.decode("utf-8"))
+                url = (payload.get("url") or "").strip()
+                timestamp = payload.get("timestamp")
+            else:
                 parsed = urllib.parse.urlparse(self.path)
                 qs = urllib.parse.parse_qs(parsed.query)
                 url = (qs.get("url") or [""])[0]
                 timestamp = (qs.get("timestamp") or [None])[0]
-                if not url: return self._respond(400, {"detail":"empty body and no url query param"})
-            else:
-                payload = json.loads(body.decode("utf-8"))
-                url = (payload.get("url") or "").strip()
-                timestamp = payload.get("timestamp")
-                if not url: return self._respond(400, {"detail":"url is required"})
-            result = analyze(url, timestamp)
-            self._respond(200, result)
+            if not url: return self._respond(400, {"detail":"url is required"})
+            self._respond(200, analyze(url, timestamp))
         except Exception as e:
             self._respond(422, {"detail": str(e)})
     def _cors(self):
